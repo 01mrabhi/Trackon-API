@@ -125,6 +125,49 @@ class TrackonAutomation:
         except Exception as e:
             logger.warning(f"Search input failed: {e}")
 
+    def extract_table_data(self):
+        """Scrapes the visible table with dynamic column detection."""
+        extracted_data = {}
+        try:
+            time.sleep(2) # Ensure table is rendered
+            if "No data available" in self.driver.page_source:
+                logger.info("No records found for this range.")
+                return extracted_data
+
+            while True:
+                # Find the table and headers
+                headers = self.driver.find_elements(By.XPATH, "//table[@id='example']/thead/tr/th")
+                col_map = {th.text.strip().upper(): i for i, th in enumerate(headers)}
+                
+                awb_idx = col_map.get("CNONO", col_map.get("AWB NO", 1))
+                weight_idx = col_map.get("WEIGHT", 10)
+                
+                rows = self.driver.find_elements(By.XPATH, "//table[@id='example']/tbody/tr")
+                for row in rows:
+                    cells = row.find_elements(By.TAG_NAME, "td")
+                    if len(cells) > max(awb_idx, weight_idx):
+                        awb = cells[awb_idx].text.strip()
+                        weight = cells[weight_idx].text.strip()
+                        if awb:
+                            extracted_data[awb] = weight
+                
+                # Pagination
+                try:
+                    next_btn = self.driver.find_element(By.ID, "example_next")
+                    if "disabled" in next_btn.get_attribute("class"):
+                        break
+                    self.driver.execute_script("arguments[0].scrollIntoView();", next_btn)
+                    next_btn.click()
+                    time.sleep(2)
+                except NoSuchElementException:
+                    break
+                    
+        except Exception as e:
+            logger.error(f"Error during data extraction: {e}")
+            
+        logger.info(f"Extracted {len(extracted_data)} unique AWB weights.")
+        return extracted_data
+
     def run(self):
         pass
 
