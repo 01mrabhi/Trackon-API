@@ -26,6 +26,14 @@ class TrackonAutomation:
         self.driver = None
         self.wait = None
 
+    def setup_driver(self):
+        logger.info("Initializing Chrome Driver...")
+        options = webdriver.ChromeOptions()
+        options.add_argument("--start-maximized")
+        # Try to use standard service setup
+        self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        self.wait = WebDriverWait(self.driver, 20)
+
     def run(self):
         pass
 
