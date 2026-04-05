@@ -169,7 +169,65 @@ class TrackonAutomation:
         return extracted_data
 
     def run(self):
-        pass
+        try:
+            # 0. Validate Excel
+            if not os.path.exists(self.excel_path):
+                logger.error(f"{self.excel_path} not found.")
+                return
+
+            # Load data from Row 11 (skiprows=10)
+            logger.info(f"Loading data from {self.excel_path} (skipping header rows)...")
+            df = pd.read_excel(self.excel_path, skiprows=10)
+            
+            # Normalize column names for mapping
+            normalized_cols = {str(c).strip().upper(): c for c in df.columns}
+            cno_key = next((v for k, v in normalized_cols.items() if "CNO" in k), None)
+            date_key = next((v for k, v in normalized_cols.items() if "DATE" in k), None)
+            weight_key = next((v for k, v in normalized_cols.items() if "WEIGHT" in k), None)
+
+            if not cno_key or not date_key:
+                logger.error(f"Missing required columns (CNO. or DATE). Columns found: {df.columns.tolist()}")
+                return
+
+            # Convert to datetime handling DD.MM.YYYY
+            df[date_key] = pd.to_datetime(df[date_key], format='%d.%m.%Y', dayfirst=True, errors='coerce')
+            
+            # Identify the unique dates or ranges
+            if not df.empty:
+                valid_dates = df[date_key].dropna()
+                if valid_dates.empty:
+                    logger.error("No valid dates found in the DATE column.")
+                    return
+                min_date = valid_dates.min()
+                max_date = valid_dates.max()
+            else:
+                logger.info("Excel data is empty.")
+                return
+
+            self.setup_driver()
+            self.login_manual()
+            self.navigate_to_reports()
+
+            all_extracted_weights = {}
+
+            # Execute searches in chunks
+            temp_start = min_date
+            while temp_start <= max_date:
+                temp_end = min(temp_start + timedelta(days=6), max_date)
+                
+                self.perform_search(temp_start, temp_end)
+                batch_results = self.extract_table_data()
+                all_extracted_weights.update(batch_results)
+                
+                temp_start = temp_end + timedelta(days=1)
+
+        except Exception as e:
+            logger.critical(f"FATAL ERROR: {e}", exc_info=True)
+        finally:
+            if self.driver:
+                logger.info("Closing browser...")
+                self.driver.quit()
+            logger.info("--- Session Finished ---")
 
 if __name__ == "__main__":
     app = TrackonAutomation(EXCEL_PATH)
