@@ -221,6 +221,43 @@ class TrackonAutomation:
                 
                 temp_start = temp_end + timedelta(days=1)
 
+            # Map the results back to the Excel rows using openpyxl to keep the layout
+            import openpyxl
+            logger.info("Writing weights back to Excel while preserving layout...")
+            
+            wb = openpyxl.load_workbook(self.excel_path)
+            ws = wb.active
+            
+            # Based on the screenshot, WEIGHT is Column F (index 6)
+            # Find the WEIGHT column dynamically just in case
+            weight_col_idx = 6 # Default to F
+            for cell in ws[11]: # Row 11 has headers
+                if cell.value and "WEIGHT" in str(cell.value).upper():
+                    weight_col_idx = cell.column
+                    break
+
+            count = 0
+            for i, row in df.iterrows():
+                # Clean Docket ID (remove .0 suffix pandas adds to numbers)
+                cno_id = str(row[cno_key]).strip().split('.')[0]
+                
+                # Check if we have a new weight for this CNO
+                if cno_id in all_extracted_weights:
+                    # Skip if already has weight in the dataframe (optional)
+                    if pd.notnull(row[weight_key]) and str(row[weight_key]).strip() != "":
+                        continue
+                    
+                    # Update cell in original workbook structure
+                    # Row 11 is header, so row i of df is Row 12 (i=0 -> 12)
+                    target_row = i + 12
+                    ws.cell(row=target_row, column=weight_col_idx).value = all_extracted_weights[cno_id]
+                    count += 1
+
+            # Save the updated workbook
+            wb.save(OUTPUT_PATH)
+            logger.info(f"Update Complete! {count} weights updated and formatting preserved.")
+            logger.info(f"File saved as: {OUTPUT_PATH}")
+
         except Exception as e:
             logger.critical(f"FATAL ERROR: {e}", exc_info=True)
         finally:
