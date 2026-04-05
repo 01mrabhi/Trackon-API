@@ -90,6 +90,41 @@ class TrackonAutomation:
             logger.error(f"Failed to navigate to reports: {e}")
             raise
 
+    def perform_search(self, from_date, to_date):
+        """Inputs dates and performs search."""
+        from_str = from_date.strftime("%d-%m-%Y")
+        to_str = to_date.strftime("%d-%m-%Y")
+        logger.info(f"==> Searching Range: {from_str} to {to_str}")
+        
+        try:
+            # Clear and Type From Date
+            from_input = self.driver.find_element(By.ID, "txtFromDate")
+            # Clear doesn't always work on date pickers, so use JS
+            self.driver.execute_script("arguments[0].value = '';", from_input)
+            from_input.send_keys(from_str)
+            
+            # Clear and Type To Date
+            to_input = self.driver.find_element(By.ID, "txtToDate")
+            self.driver.execute_script("arguments[0].value = '';", to_input)
+            to_input.send_keys(to_str)
+            
+            # Select Product Type = "ALL"
+            # It's an orange dropdown in the screenshot
+            product_select_elem = self.driver.find_element(By.ID, "ddlProductType")
+            product_select = Select(product_select_elem)
+            product_select.select_by_visible_text("ALL")
+            
+            # Click SEARCH
+            search_btn = self.driver.find_element(By.ID, "btnSearch")
+            search_btn.click()
+            
+            # Wait for the table show message or table rows
+            time.sleep(4) 
+            logger.info("Search button clicked. Waiting for results...")
+            
+        except Exception as e:
+            logger.warning(f"Search input failed: {e}")
+
     def run(self):
         pass
 
