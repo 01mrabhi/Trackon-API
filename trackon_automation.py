@@ -368,8 +368,26 @@ class TrackonAutomation:
             wb = openpyxl.load_workbook(self.excel_path)
             ws = wb.active
             
-            # Find header row and column mapping
-            headers = [cell.value for cell in ws[11]]
+            # Find header row dynamically (supports shifting tables due to header metadata)
+            header_row_idx = None
+            headers = None
+            for r_idx in range(1, 30):
+                row_vals = [cell.value for cell in ws[r_idx]]
+                normalized_vals = [str(v).strip().upper() for v in row_vals if v is not None]
+                has_date = any("DATE" in v for v in normalized_vals)
+                has_cno = any(any(x in v for x in ["CNO", "C.NOTE", "AWB", "DOCKET", "C.NO", "C NO"]) for v in normalized_vals)
+                
+                if has_date and has_cno:
+                    header_row_idx = r_idx
+                    headers = row_vals
+                    self.log_progress(f"Dynamically detected header row at Row {header_row_idx}: {headers}")
+                    break
+                    
+            if not header_row_idx:
+                self.log_progress("Could not dynamically find header row, falling back to Row 11.")
+                header_row_idx = 11
+                headers = [cell.value for cell in ws[11]]
+
             header_map = {}
             for col_idx, val in enumerate(headers, start=1):
                 if val:
@@ -395,11 +413,11 @@ class TrackonAutomation:
                 weight_col_idx = 5
                 self.log_progress(f"WEIGHT column not found in headers, defaulting to Column {weight_col_idx}")
 
-            # Read all rows starting from row 12
+            # Read all rows starting from row after headers dynamically
             rows_data = []
             valid_dates = []
             
-            for row_idx in range(12, ws.max_row + 1):
+            for row_idx in range(header_row_idx + 1, ws.max_row + 1):
                 cno_val = ws.cell(row=row_idx, column=cno_col_idx).value
                 date_val = ws.cell(row=row_idx, column=date_col_idx).value
                 weight_val = ws.cell(row=row_idx, column=weight_col_idx).value
