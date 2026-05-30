@@ -9,3 +9,4 @@ env/
 *.xlsx
 !bookings.xlsx
 *.log
+runs/

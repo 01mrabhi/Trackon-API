@@ -1,7 +1,6 @@
 import os
 import time
 import logging
-import pandas as pd
 from datetime import datetime, timedelta
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -10,6 +9,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import openpyxl
 
 # --- Configuration ---
 EXCEL_PATH = "bookings.xlsx"
@@ -21,38 +21,142 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class TrackonAutomation:
-    def __init__(self, excel_path):
+    def __init__(self, excel_path, username=None, password=None, captcha_api_key=None, headless=False, run_id=None):
         self.excel_path = os.path.join(os.getcwd(), excel_path)
+        self.username = username
+        self.password = password
+        self.captcha_api_key = captcha_api_key
+        self.headless = headless
+        
         self.driver = None
         self.wait = None
+        
+        # State tracking for API status queries
+        self.state = {
+            "run_id": run_id,
+            "status": "queued",
+            "progress": 0,
+            "total_rows": 0,
+            "processed_rows": 0,
+            "weights_updated": 0,
+            "logs": [],
+            "error": None,
+            "start_time": None,
+            "end_time": None
+        }
+        self.log_progress("Automation job initialized.")
+
+    def log_progress(self, message):
+        """Helper to log messages and store them in the run state."""
+        logger.info(message)
+        self.state["logs"].append(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}")
+        if self.state.get("run_id"):
+            try:
+                import json
+                run_dir = os.path.join(os.getcwd(), "runs", self.state["run_id"])
+                os.makedirs(run_dir, exist_ok=True)
+                with open(os.path.join(run_dir, "metadata.json"), "w") as f:
+                    json.dump(self.state, f, indent=4)
+            except Exception as meta_err:
+                logger.error(f"Failed to write run metadata: {meta_err}")
 
     def setup_driver(self):
-        logger.info("Initializing Chrome Driver...")
+        self.log_progress("Initializing Chrome Driver...")
         options = webdriver.ChromeOptions()
         options.add_argument("--start-maximized")
-        # Try to use standard service setup
+        
+        if self.headless:
+            self.log_progress("Running Chrome in Headless Mode...")
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            # Set a standard User Agent to act like a real browser
+            options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+            
         self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
         self.wait = WebDriverWait(self.driver, 20)
 
+    def login_automated(self):
+        """Fills franchisee login credentials, captures CAPTCHA, solves it using 2Captcha, and submits."""
+        import captcha_solver
+        
+        # 1. Fill Username
+        self.log_progress("Entering Franchisee ID...")
+        user_field = self.wait.until(EC.presence_of_element_located((By.ID, "txtuserId")))
+        user_field.clear()
+        user_field.send_keys(self.username)
+        
+        # 2. Fill Password
+        self.log_progress("Entering password...")
+        pass_field = self.wait.until(EC.presence_of_element_located((By.ID, "txtPassword")))
+        pass_field.clear()
+        pass_field.send_keys(self.password)
+        
+        # 3. Capture CAPTCHA Image screenshot
+        self.log_progress("Capturing CAPTCHA image element...")
+        captcha_img = self.wait.until(EC.presence_of_element_located((By.ID, "captchaImage")))
+        time.sleep(1) # Small buffer for rendering
+        captcha_bytes = captcha_img.screenshot_as_png
+        
+        # 4. Solve CAPTCHA via 2Captcha
+        self.log_progress("Requesting CAPTCHA solution from 2Captcha service...")
+        captcha_text = captcha_solver.solve_captcha(captcha_bytes, self.captcha_api_key)
+        self.log_progress(f"CAPTCHA solved! Result: '{captcha_text}'")
+        
+        # 5. Fill CAPTCHA input field
+        captcha_field = self.wait.until(EC.presence_of_element_located((By.NAME, "CaptchaCode")))
+        captcha_field.clear()
+        captcha_field.send_keys(captcha_text)
+        
+        # 6. Click SIGN IN
+        self.log_progress("Clicking SIGN IN...")
+        signin_btn = self.wait.until(EC.presence_of_element_located((By.XPATH, "//button[contains(@class, 'btn-signin')] | //button[contains(text(), 'SIGN IN')]")))
+        self.driver.execute_script("arguments[0].click();", signin_btn)
+        
+        # 7. Confirm Login Success
+        time.sleep(2)
+        try:
+            self.log_progress("Verifying dashboard load...")
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.XPATH, "//span[contains(text(), 'Reports')] | //a[contains(., 'Reports')]"))
+            )
+            self.log_progress("Automated Headless Login Verified successfully!")
+        except TimeoutException:
+            # Check for rejected credentials/captcha errors in the page source
+            page_text = self.driver.page_source
+            if any(x in page_text.lower() for x in ["invalid", "wrong", "error", "incorrect", "captcha"]):
+                raise RuntimeError("Login failed: Invalid CAPTCHA code or incorrect franchisee credentials.")
+            raise RuntimeError("Dashboard page took too long to load.")
+
     def login_manual(self):
-        """Navigates to login and waits for manual intervention."""
-        self.driver.get(BASE_URL)
+        """Navigates directly to the Franchisee Login portal and handles automated or manual login."""
+        login_url = "https://ba.trackon.in/"
+        self.log_progress(f"Navigating directly to Franchisee Login: {login_url}")
+        self.driver.get(login_url)
         
         try:
-            # wait for overlay or main page
-            time.sleep(3) 
+            # Check if we should execute fully automated headless login
+            if self.headless and self.username and self.password and self.captcha_api_key:
+                self.log_progress("Automated login credentials found. Attempting headless 2Captcha login...")
+                try:
+                    self.login_automated()
+                    return
+                except Exception as e:
+                    self.log_progress(f"Automated login attempt failed: {e}. Retrying login...")
+                    # Try reloading page and solving captcha again (up to 2 retry attempts)
+                    for attempt in range(2):
+                        try:
+                            self.driver.get(login_url)
+                            time.sleep(3)
+                            self.login_automated()
+                            return
+                        except Exception as retry_err:
+                            self.log_progress(f"Login retry attempt {attempt + 1} failed: {retry_err}")
+                    raise RuntimeError("Headless automated login failed after multiple attempts.")
             
-            # 1. Click Login Dropdown (Top Right)
-            logger.info("Locating Login dropdown...")
-            # Based on screenshot, 'Login' is a text link with a caret
-            login_menu = self.wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(., 'Login')]")))
-            login_menu.click()
-            
-            # 2. Click Franchisee Login
-            logger.info("Clicking Franchisee Login...")
-            franchise_link = self.wait.until(EC.element_to_be_clickable((By.LINK_TEXT, "Franchisee Login")))
-            franchise_link.click()
-            
+            # Manual fallback mode (if running visual local mode or key is missing)
+            self.log_progress("Falling back to manual browser login...")
             print("\n" + "!" * 60)
             print("ACTION REQUIRED: PLEASE LOG IN MANUALLY IN THE BROWSER WINDOW.")
             print("1. Enter your Franchisee credentials.")
@@ -61,88 +165,157 @@ class TrackonAutomation:
             print("4. Wait until you see the 'Dashboards' screen.")
             print("!" * 60 + "\n")
             
-            # Wait for dashboard sidebar element to appear to confirm login success
-            # The sidebar has 'Reports' as seen in the screenshot
-            self.wait.until(EC.presence_of_element_located((By.XPATH, "//span[contains(text(), 'Reports')] | //a[contains(., 'Reports')]")))
-            logger.info("Login confirmed. Proceeding with automation...")
+            # Wait up to 300 seconds (5 minutes) for the user to complete the manual login
+            self.log_progress("Waiting for manual login (up to 300 seconds)...")
+            WebDriverWait(self.driver, 300).until(
+                EC.presence_of_element_located((By.XPATH, "//span[contains(text(), 'Reports')] | //a[contains(., 'Reports')]"))
+            )
+            self.log_progress("Login confirmed. Proceeding with automation...")
 
         except Exception as e:
-            logger.error(f"Error during login navigation: {e}")
+            self.log_progress(f"Error during login navigation: {e}")
             raise
 
     def navigate_to_reports(self):
         """Navigates to Reports -> Booking Information."""
-        logger.info("Navigating to Reports > Booking Information...")
+        self.log_progress("Navigating to Reports > Booking Information...")
         try:
+            # Wait for customPreloader to fade out/become invisible if it exists
+            try:
+                self.log_progress("Waiting for dashboard preloader to disappear...")
+                WebDriverWait(self.driver, 15).until(
+                    EC.invisibility_of_element_located((By.ID, "customPreloader"))
+                )
+                self.log_progress("Preloader is gone.")
+            except Exception:
+                self.log_progress("Preloader check timed out or not present, proceeding...")
+                
             # Click Reports (Side menu)
-            reports_menu = self.wait.until(EC.element_to_be_clickable((By.XPATH, "//span[contains(text(), 'Reports')] | //a[contains(., 'Reports')]")))
-            reports_menu.click()
+            reports_menu = self.wait.until(EC.presence_of_element_located((By.XPATH, "//span[contains(text(), 'Reports')] | //a[contains(., 'Reports')]")))
+            self.driver.execute_script("arguments[0].click();", reports_menu)
             time.sleep(1) # Small pause for submenu expansion
             
             # Click Booking Information
-            booking_info = self.wait.until(EC.element_to_be_clickable((By.LINK_TEXT, "Booking Information")))
-            booking_info.click()
+            booking_info = self.wait.until(EC.presence_of_element_located((By.LINK_TEXT, "Booking Information")))
+            self.driver.execute_script("arguments[0].click();", booking_info)
             
-            # Wait for the search form to load
-            self.wait.until(EC.presence_of_element_located((By.ID, "txtFromDate")))
-            logger.info("Report page loaded.")
+            # Wait for the search form to load using the new ID tbfromDate
+            time.sleep(3) # Give page transition some time
+            self.wait.until(EC.presence_of_element_located((By.ID, "tbfromDate")))
+            self.log_progress("Report page loaded successfully.")
         except Exception as e:
-            logger.error(f"Failed to navigate to reports: {e}")
+            self.log_progress(f"Failed to navigate to reports: {e}")
+            try:
+                inputs = self.driver.find_elements(By.TAG_NAME, "input")
+                self.log_progress(f"Current page URL: {self.driver.current_url}")
+                self.log_progress(f"Input elements found: {[i.get_attribute('id') for i in inputs]}")
+            except Exception:
+                pass
             raise
 
     def perform_search(self, from_date, to_date):
         """Inputs dates and performs search."""
-        from_str = from_date.strftime("%d-%m-%Y")
-        to_str = to_date.strftime("%d-%m-%Y")
-        logger.info(f"==> Searching Range: {from_str} to {to_str}")
+        from_str = from_date.strftime("%Y-%m-%d")
+        to_str = to_date.strftime("%Y-%m-%d")
+        self.log_progress(f"==> Searching Range: {from_date.strftime('%d-%m-%Y')} to {to_date.strftime('%d-%m-%Y')}")
         
         try:
-            # Clear and Type From Date
-            from_input = self.driver.find_element(By.ID, "txtFromDate")
-            # Clear doesn't always work on date pickers, so use JS
-            self.driver.execute_script("arguments[0].value = '';", from_input)
-            from_input.send_keys(from_str)
+            # Set Date values via JavaScript
+            from_input = self.driver.find_element(By.ID, "tbfromDate")
+            self.driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", from_input, from_str)
             
-            # Clear and Type To Date
-            to_input = self.driver.find_element(By.ID, "txtToDate")
-            self.driver.execute_script("arguments[0].value = '';", to_input)
-            to_input.send_keys(to_str)
+            to_input = self.driver.find_element(By.ID, "tbtoDate")
+            self.driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", to_input, to_str)
             
             # Select Product Type = "ALL"
-            # It's an orange dropdown in the screenshot
-            product_select_elem = self.driver.find_element(By.ID, "ddlProductType")
+            product_select_elem = self.driver.find_element(By.ID, "ddlproductype")
             product_select = Select(product_select_elem)
-            product_select.select_by_visible_text("ALL")
+            try:
+                product_select.select_by_value("All")
+                self.log_progress("Selected Product Type: 'All Product'")
+            except Exception:
+                try:
+                    product_select.select_by_visible_text("All Product")
+                    self.log_progress("Selected Product Type: 'All Product'")
+                except Exception as p_err:
+                    self.log_progress(f"Could not select 'All Product', choosing first: {p_err}")
+                    product_select.select_by_index(0)
+                    
+            # Select Report Type = Booking Details (Value: 'D')
+            try:
+                report_select_elem = self.driver.find_element(By.ID, "ddlreporttype")
+                report_select = Select(report_select_elem)
+                report_select.select_by_value("D")
+                self.log_progress("Selected Report Type: 'Booking Details - 7 Days'")
+            except Exception as report_err:
+                self.log_progress(f"Could not select ddlreporttype: {report_err}")
             
-            # Click SEARCH
+            # Click SEARCH via Javascript
             search_btn = self.driver.find_element(By.ID, "btnSearch")
-            search_btn.click()
+            self.driver.execute_script("arguments[0].click();", search_btn)
             
-            # Wait for the table show message or table rows
-            time.sleep(4) 
-            logger.info("Search button clicked. Waiting for results...")
+            # Wait for search results to fetch
+            time.sleep(5) 
+            self.log_progress("Search triggered. Waiting for results...")
             
         except Exception as e:
-            logger.warning(f"Search input failed: {e}")
+            self.log_progress(f"Search input failed: {e}")
 
     def extract_table_data(self):
-        """Scrapes the visible table with dynamic column detection."""
+        """Scrapes the visible table with dynamic column detection and page navigation."""
         extracted_data = {}
         try:
-            time.sleep(2) # Ensure table is rendered
-            if "No data available" in self.driver.page_source:
-                logger.info("No records found for this range.")
-                return extracted_data
+            self.log_progress("Waiting for table results to load (up to 15 seconds)...")
+            start_time = time.time()
+            table_loaded = False
+            
+            while time.time() - start_time < 15:
+                try:
+                    rows = self.driver.find_elements(By.XPATH, "//table[@id='tbldetails']/tbody/tr")
+                    if rows:
+                        first_row_text = rows[0].text.strip()
+                        # Check for placeholder rows
+                        if any(x in first_row_text for x in ["No data available", "No records found", "No booking found"]):
+                            self.log_progress(f"Placeholder detected: '{first_row_text}'. No records for this range.")
+                            return extracted_data
+                        
+                        # Verify the first row actually has cells
+                        cells = rows[0].find_elements(By.TAG_NAME, "td")
+                        if len(cells) > 2:
+                            self.log_progress(f"Loaded row detected! First cell content: '{cells[0].text.strip()}'. Scraping...")
+                            table_loaded = True
+                            break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+            if not table_loaded:
+                self.log_progress("Table loading timed out. Checking page source as fallback...")
+                if "No data available" in self.driver.page_source or "No records found" in self.driver.page_source:
+                    self.log_progress("No records found for this range.")
+                    return extracted_data
 
             while True:
                 # Find the table and headers
-                headers = self.driver.find_elements(By.XPATH, "//table[@id='example']/thead/tr/th")
+                headers = self.driver.find_elements(By.XPATH, "//table[@id='tbldetails']/thead/tr/th")
                 col_map = {th.text.strip().upper(): i for i, th in enumerate(headers)}
                 
-                awb_idx = col_map.get("CNONO", col_map.get("AWB NO", 1))
-                weight_idx = col_map.get("WEIGHT", 10)
+                # Dynamically locate columns based on substrings
+                awb_idx = None
+                weight_idx = None
+                for col_name, idx in col_map.items():
+                    if any(x in col_name for x in ["AWB", "CNO", "CNONO", "DOCKET", "C.NOTE"]):
+                        awb_idx = idx
+                    elif "WEIGHT" in col_name:
+                        weight_idx = idx
+
+                # Defaults if column header detection was imperfect
+                if awb_idx is None:
+                    awb_idx = col_map.get("CNONO", col_map.get("AWB NO", 1))
+                if weight_idx is None:
+                    weight_idx = col_map.get("WEIGHT", 4)
                 
-                rows = self.driver.find_elements(By.XPATH, "//table[@id='example']/tbody/tr")
+                rows = self.driver.find_elements(By.XPATH, "//table[@id='tbldetails']/tbody/tr")
                 for row in rows:
                     cells = row.find_elements(By.TAG_NAME, "td")
                     if len(cells) > max(awb_idx, weight_idx):
@@ -151,59 +324,125 @@ class TrackonAutomation:
                         if awb:
                             extracted_data[awb] = weight
                 
-                # Pagination
+                # Pagination logic for the DataTable structure
                 try:
-                    next_btn = self.driver.find_element(By.ID, "example_next")
-                    if "disabled" in next_btn.get_attribute("class"):
+                    next_btn = None
+                    for possible_id in ["tbldetails_next", "example_next"]:
+                        try:
+                            next_btn = self.driver.find_element(By.ID, possible_id)
+                            break
+                        except NoSuchElementException:
+                            continue
+                    
+                    if not next_btn:
+                        possible_nexts = self.driver.find_elements(By.XPATH, "//a[contains(@class, 'next') or contains(text(), 'Next')] | //button[contains(@class, 'next') or contains(text(), 'Next')]")
+                        if possible_nexts:
+                            next_btn = possible_nexts[0]
+                    
+                    if not next_btn or "disabled" in next_btn.get_attribute("class") or next_btn.get_attribute("disabled") is not None:
                         break
+                        
                     self.driver.execute_script("arguments[0].scrollIntoView();", next_btn)
-                    next_btn.click()
+                    self.driver.execute_script("arguments[0].click();", next_btn)
                     time.sleep(2)
-                except NoSuchElementException:
+                except Exception as pag_err:
+                    self.log_progress(f"No more pages or pagination completed: {pag_err}")
                     break
                     
         except Exception as e:
-            logger.error(f"Error during data extraction: {e}")
+            self.log_progress(f"Error during data extraction: {e}")
             
-        logger.info(f"Extracted {len(extracted_data)} unique AWB weights.")
+        self.log_progress(f"Extracted {len(extracted_data)} unique AWB weights in this batch.")
         return extracted_data
 
     def run(self):
+        self.state["status"] = "running"
+        self.state["start_time"] = datetime.now().isoformat()
+        
         try:
             # 0. Validate Excel
             if not os.path.exists(self.excel_path):
-                logger.error(f"{self.excel_path} not found.")
-                return
+                raise FileNotFoundError(f"{self.excel_path} not found.")
 
-            # Load data from Row 11 (skiprows=10)
-            logger.info(f"Loading data from {self.excel_path} (skipping header rows)...")
-            df = pd.read_excel(self.excel_path, skiprows=10)
+            self.log_progress(f"Loading data from {self.excel_path} using openpyxl...")
+            wb = openpyxl.load_workbook(self.excel_path)
+            ws = wb.active
             
-            # Normalize column names for mapping
-            normalized_cols = {str(c).strip().upper(): c for c in df.columns}
-            cno_key = next((v for k, v in normalized_cols.items() if "CNO" in k), None)
-            date_key = next((v for k, v in normalized_cols.items() if "DATE" in k), None)
-            weight_key = next((v for k, v in normalized_cols.items() if "WEIGHT" in k), None)
-
-            if not cno_key or not date_key:
-                logger.error(f"Missing required columns (CNO. or DATE). Columns found: {df.columns.tolist()}")
-                return
-
-            # Convert to datetime handling DD.MM.YYYY
-            df[date_key] = pd.to_datetime(df[date_key], format='%d.%m.%Y', dayfirst=True, errors='coerce')
+            # Find header row and column mapping
+            headers = [cell.value for cell in ws[11]]
+            header_map = {}
+            for col_idx, val in enumerate(headers, start=1):
+                if val:
+                    header_map[str(val).strip().upper()] = col_idx
             
-            # Identify the unique dates or ranges
-            if not df.empty:
-                valid_dates = df[date_key].dropna()
-                if valid_dates.empty:
-                    logger.error("No valid dates found in the DATE column.")
-                    return
-                min_date = valid_dates.min()
-                max_date = valid_dates.max()
-            else:
-                logger.info("Excel data is empty.")
-                return
+            # Find exact keys
+            cno_col_idx = None
+            date_col_idx = None
+            weight_col_idx = None
+            
+            for k, idx in header_map.items():
+                if any(x in k for x in ["CNO", "C.NOTE", "AWB", "DOCKET", "C.NO", "C NO"]):
+                    cno_col_idx = idx
+                elif "DATE" in k:
+                    date_col_idx = idx
+                elif "WEIGHT" in k:
+                    weight_col_idx = idx
+            
+            if not cno_col_idx or not date_col_idx:
+                raise ValueError(f"Missing required columns (C.NOTE.NO / CNO. or DATE). Headers found: {headers}")
 
+            if not weight_col_idx:
+                weight_col_idx = 5
+                self.log_progress(f"WEIGHT column not found in headers, defaulting to Column {weight_col_idx}")
+
+            # Read all rows starting from row 12
+            rows_data = []
+            valid_dates = []
+            
+            for row_idx in range(12, ws.max_row + 1):
+                cno_val = ws.cell(row=row_idx, column=cno_col_idx).value
+                date_val = ws.cell(row=row_idx, column=date_col_idx).value
+                weight_val = ws.cell(row=row_idx, column=weight_col_idx).value
+                
+                if cno_val is None:
+                    continue # Skip empty row
+                
+                # Parse date_val
+                parsed_date = None
+                if isinstance(date_val, datetime):
+                    parsed_date = date_val
+                elif isinstance(date_val, str):
+                    date_str = date_val.strip()
+                    for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                        try:
+                            parsed_date = datetime.strptime(date_str, fmt)
+                            break
+                        except ValueError:
+                            continue
+                
+                if parsed_date:
+                    valid_dates.append(parsed_date)
+                
+                rows_data.append({
+                    'row_idx': row_idx,
+                    'cno': cno_val,
+                    'date': parsed_date,
+                    'weight': weight_val
+                })
+
+            if not rows_data:
+                raise ValueError("Excel data is empty.")
+
+            if not valid_dates:
+                raise ValueError("No valid dates found in the DATE column.")
+
+            min_date = min(valid_dates)
+            max_date = max(valid_dates)
+            self.state["total_rows"] = len(rows_data)
+            
+            self.log_progress(f"Loaded {len(rows_data)} rows. Date range found: {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
+
+            # Initialize selenium
             self.setup_driver()
             self.login_manual()
             self.navigate_to_reports()
@@ -221,51 +460,73 @@ class TrackonAutomation:
                 
                 temp_start = temp_end + timedelta(days=1)
 
-            # Map the results back to the Excel rows using openpyxl to keep the layout
-            import openpyxl
-            logger.info("Writing weights back to Excel while preserving layout...")
-            
-            wb = openpyxl.load_workbook(self.excel_path)
-            ws = wb.active
-            
-            # Based on the screenshot, WEIGHT is Column F (index 6)
-            # Find the WEIGHT column dynamically just in case
-            weight_col_idx = 6 # Default to F
-            for cell in ws[11]: # Row 11 has headers
-                if cell.value and "WEIGHT" in str(cell.value).upper():
-                    weight_col_idx = cell.column
-                    break
-
+            # Write results back to Excel
+            self.log_progress("Writing weights back to Excel...")
             count = 0
-            for i, row in df.iterrows():
-                # Clean Docket ID (remove .0 suffix pandas adds to numbers)
-                cno_id = str(row[cno_key]).strip().split('.')[0]
+            for row in rows_data:
+                cno_id = str(row['cno']).strip().split('.')[0]
                 
-                # Check if we have a new weight for this CNO
+                self.state["processed_rows"] += 1
+                # Progress percentage
+                self.state["progress"] = int((self.state["processed_rows"] / self.state["total_rows"]) * 100)
+                
                 if cno_id in all_extracted_weights:
-                    # Skip if already has weight in the dataframe (optional)
-                    if pd.notnull(row[weight_key]) and str(row[weight_key]).strip() != "":
+                    if row['weight'] is not None and str(row['weight']).strip() != "":
                         continue
                     
-                    # Update cell in original workbook structure
-                    # Row 11 is header, so row i of df is Row 12 (i=0 -> 12)
-                    target_row = i + 12
-                    ws.cell(row=target_row, column=weight_col_idx).value = all_extracted_weights[cno_id]
-                    count += 1
+                    # Formats weight as "{weight} KG"
+                    raw_weight = str(all_extracted_weights[cno_id]).strip()
+                    if raw_weight:
+                        cleaned_weight = raw_weight.upper().replace("KG", "").strip()
+                        formatted_weight = f"{cleaned_weight} KG"
+                        ws.cell(row=row['row_idx'], column=weight_col_idx).value = formatted_weight
+                        count += 1
+
+            self.state["weights_updated"] = count
 
             # Save the updated workbook
-            wb.save(OUTPUT_PATH)
-            logger.info(f"Update Complete! {count} weights updated and formatting preserved.")
-            logger.info(f"File saved as: {OUTPUT_PATH}")
+            # If a custom output path is provided in metadata, write there
+            output_dir = os.path.dirname(self.excel_path)
+            output_file = os.path.join(output_dir, "bookings_updated.xlsx")
+            wb.save(output_file)
+            
+            self.log_progress(f"Update Complete! {count} weights updated and formatting preserved.")
+            self.log_progress(f"File saved successfully to: {output_file}")
+            
+            self.state["status"] = "completed"
+            self.state["progress"] = 100
 
         except Exception as e:
-            logger.critical(f"FATAL ERROR: {e}", exc_info=True)
+            self.state["status"] = "failed"
+            self.state["error"] = str(e)
+            self.log_progress(f"FATAL ERROR ENCOUNTERED: {e}")
         finally:
             if self.driver:
-                logger.info("Closing browser...")
+                self.log_progress("Closing browser...")
                 self.driver.quit()
-            logger.info("--- Session Finished ---")
+            self.state["end_time"] = datetime.now().isoformat()
+            self.log_progress("--- Session Finished ---")
 
 if __name__ == "__main__":
-    app = TrackonAutomation(EXCEL_PATH)
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    username = os.getenv("TRACKON_USERNAME")
+    password = os.getenv("TRACKON_PASSWORD")
+    captcha_key = os.getenv("TWOCAPTCHA_API_KEY")
+    
+    # Run headlessly if credentials and 2Captcha key exist, otherwise fall back to manual interactive mode
+    run_headless = bool(username and password and captcha_key)
+    if run_headless:
+        logger.info("Credentials and CAPTCHA key detected in .env. Running in headless automated mode!")
+    else:
+        logger.info("No CAPTCHA key or credentials found. Running in interactive manual fallback mode!")
+        
+    app = TrackonAutomation(
+        excel_path=EXCEL_PATH,
+        username=username,
+        password=password,
+        captcha_api_key=captcha_key,
+        headless=run_headless
+    )
     app.run()
