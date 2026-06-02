@@ -215,17 +215,49 @@ class TrackonAutomation:
 
     def perform_search(self, from_date, to_date):
         """Inputs dates and performs search."""
-        from_str = from_date.strftime("%Y-%m-%d")
-        to_str = to_date.strftime("%Y-%m-%d")
-        self.log_progress(f"==> Searching Range: {from_date.strftime('%d-%m-%Y')} to {to_date.strftime('%d-%m-%Y')}")
-        
         try:
-            # Set Date values via JavaScript
-            from_input = self.driver.find_element(By.ID, "tbfromDate")
-            self.driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", from_input, from_str)
+            # Locate input elements
+            from_input = self.wait.until(EC.presence_of_element_located((By.ID, "tbfromDate")))
+            to_input = self.wait.until(EC.presence_of_element_located((By.ID, "tbtoDate")))
             
-            to_input = self.driver.find_element(By.ID, "tbtoDate")
-            self.driver.execute_script("arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('change'));", to_input, to_str)
+            # Dynamically detect portal date format from pre-populated value
+            default_val = from_input.get_attribute("value") or ""
+            input_type = from_input.get_attribute("type") or "text"
+            self.log_progress(f"Detected default date value on portal: '{default_val}', input type: '{input_type}'")
+            
+            if input_type == "date":
+                fmt = "%Y-%m-%d"
+            elif "/" in default_val:
+                fmt = "%d/%m/%Y"
+            elif "-" in default_val:
+                parts = default_val.split("-")
+                if len(parts) == 3 and len(parts[0]) == 4:
+                    fmt = "%Y-%m-%d"
+                else:
+                    fmt = "%d-%m-%Y"
+            else:
+                # Default fallback for Trackon/Indian format
+                fmt = "%d-%m-%Y"
+                
+            from_str = from_date.strftime(fmt)
+            to_str = to_date.strftime(fmt)
+            self.log_progress(f"==> Searching Range (Detected Format: {fmt}): {from_str} to {to_str}")
+            
+            # Set Date values via JavaScript
+            self.driver.execute_script(
+                "arguments[0].value = arguments[1]; "
+                "arguments[0].setAttribute('value', arguments[1]); "
+                "arguments[0].dispatchEvent(new Event('change')); "
+                "arguments[0].dispatchEvent(new Event('input'));", 
+                from_input, from_str
+            )
+            self.driver.execute_script(
+                "arguments[0].value = arguments[1]; "
+                "arguments[0].setAttribute('value', arguments[1]); "
+                "arguments[0].dispatchEvent(new Event('change')); "
+                "arguments[0].dispatchEvent(new Event('input'));", 
+                to_input, to_str
+            )
             
             # Select Product Type = "ALL"
             product_select_elem = self.driver.find_element(By.ID, "ddlproductype")
@@ -250,13 +282,27 @@ class TrackonAutomation:
             except Exception as report_err:
                 self.log_progress(f"Could not select ddlreporttype: {report_err}")
             
-            # Click SEARCH via Javascript
+            # Click SEARCH via Javascript with AJAX staleness syncing
             search_btn = self.driver.find_element(By.ID, "btnSearch")
-            self.driver.execute_script("arguments[0].click();", search_btn)
             
-            # Wait for search results to fetch
-            time.sleep(5) 
+            try:
+                old_table = self.driver.find_element(By.ID, "tbldetails")
+            except Exception:
+                old_table = None
+                
+            self.driver.execute_script("arguments[0].click();", search_btn)
             self.log_progress("Search triggered. Waiting for results...")
+            
+            # Wait for AJAX reload to complete (staleness of the old table element)
+            if old_table:
+                try:
+                    self.log_progress("Waiting for old results to clear...")
+                    WebDriverWait(self.driver, 10).until(EC.staleness_of(old_table))
+                    self.log_progress("Table refreshed. Loading new records...")
+                except Exception as sync_err:
+                    self.log_progress(f"Table refresh wait completed/skipped: {sync_err}")
+            else:
+                time.sleep(5)
             
         except Exception as e:
             self.log_progress(f"Search input failed: {e}")
@@ -295,34 +341,73 @@ class TrackonAutomation:
                     self.log_progress("No records found for this range.")
                     return extracted_data
 
+            previous_first_awb = None
+            
             while True:
-                # Find the table and headers
-                headers = self.driver.find_elements(By.XPATH, "//table[@id='tbldetails']/thead/tr/th")
-                col_map = {th.text.strip().upper(): i for i, th in enumerate(headers)}
-                
-                # Dynamically locate columns based on substrings
-                awb_idx = None
-                weight_idx = None
-                for col_name, idx in col_map.items():
-                    if any(x in col_name for x in ["AWB", "CNO", "CNONO", "DOCKET", "C.NOTE"]):
-                        awb_idx = idx
-                    elif "WEIGHT" in col_name:
-                        weight_idx = idx
+                # Scrape current page with retry logic for StaleElementReferenceExceptions
+                scraped_page_successfully = False
+                for attempt in range(3):
+                    try:
+                        # Find the table and headers
+                        headers = self.driver.find_elements(By.XPATH, "//table[@id='tbldetails']/thead/tr/th")
+                        col_map = {th.text.strip().upper(): i for i, th in enumerate(headers)}
+                        
+                        # Dynamically locate columns based on substrings
+                        awb_idx = None
+                        weight_idx = None
+                        for col_name, idx in col_map.items():
+                            if any(x in col_name for x in ["AWB", "CNO", "CNONO", "DOCKET", "C.NOTE"]):
+                                awb_idx = idx
+                            elif "WEIGHT" in col_name:
+                                weight_idx = idx
 
-                # Defaults if column header detection was imperfect
-                if awb_idx is None:
-                    awb_idx = col_map.get("CNONO", col_map.get("AWB NO", 1))
-                if weight_idx is None:
-                    weight_idx = col_map.get("WEIGHT", 4)
+                        # Defaults if column header detection was imperfect
+                        if awb_idx is None:
+                            awb_idx = col_map.get("CNONO", col_map.get("AWB NO", 1))
+                        if weight_idx is None:
+                            weight_idx = col_map.get("WEIGHT", 4)
+                        
+                        rows = self.driver.find_elements(By.XPATH, "//table[@id='tbldetails']/tbody/tr")
+                        if not rows:
+                            scraped_page_successfully = True
+                            break
+                            
+                        # Robust pagination refresh check
+                        first_row_cells = rows[0].find_elements(By.TAG_NAME, "td")
+                        if len(first_row_cells) > awb_idx:
+                            current_first_awb = first_row_cells[awb_idx].text.strip()
+                            if previous_first_awb is not None and current_first_awb == previous_first_awb:
+                                # Table has not updated to next page yet, sleep and wait for change
+                                time.sleep(1.0)
+                                rows = self.driver.find_elements(By.XPATH, "//table[@id='tbldetails']/tbody/tr")
+                        
+                        if rows:
+                            first_row_cells = rows[0].find_elements(By.TAG_NAME, "td")
+                            if len(first_row_cells) > awb_idx:
+                                previous_first_awb = first_row_cells[awb_idx].text.strip()
+                        
+                        # Fetch text values inside this try-catch to prevent stale element crashes
+                        page_data = {}
+                        for row in rows:
+                            cells = row.find_elements(By.TAG_NAME, "td")
+                            if len(cells) > max(awb_idx, weight_idx):
+                                awb = cells[awb_idx].text.strip()
+                                weight = cells[weight_idx].text.strip()
+                                if awb:
+                                    page_data[awb] = weight
+                                    
+                        # Update global results on success
+                        extracted_data.update(page_data)
+                        scraped_page_successfully = True
+                        break
+                        
+                    except Exception as scrape_err:
+                        self.log_progress(f"Temporary page scrape error (attempt {attempt + 1}/3): {scrape_err}")
+                        time.sleep(1.5) # Sleep and let DOM settle before retrying
                 
-                rows = self.driver.find_elements(By.XPATH, "//table[@id='tbldetails']/tbody/tr")
-                for row in rows:
-                    cells = row.find_elements(By.TAG_NAME, "td")
-                    if len(cells) > max(awb_idx, weight_idx):
-                        awb = cells[awb_idx].text.strip()
-                        weight = cells[weight_idx].text.strip()
-                        if awb:
-                            extracted_data[awb] = weight
+                if not scraped_page_successfully:
+                    self.log_progress("Failed to scrape current page after 3 attempts due to DOM instability. Moving on...")
+                    break
                 
                 # Pagination logic for the DataTable structure
                 try:
@@ -344,7 +429,7 @@ class TrackonAutomation:
                         
                     self.driver.execute_script("arguments[0].scrollIntoView();", next_btn)
                     self.driver.execute_script("arguments[0].click();", next_btn)
-                    time.sleep(2)
+                    time.sleep(2.5) # Increased sleep slightly for safety
                 except Exception as pag_err:
                     self.log_progress(f"No more pages or pagination completed: {pag_err}")
                     break
@@ -366,87 +451,159 @@ class TrackonAutomation:
 
             self.log_progress(f"Loading data from {self.excel_path} using openpyxl...")
             wb = openpyxl.load_workbook(self.excel_path)
-            ws = wb.active
             
-            # Find header row dynamically (supports shifting tables due to header metadata)
-            header_row_idx = None
-            headers = None
-            for r_idx in range(1, 30):
-                row_vals = [cell.value for cell in ws[r_idx]]
-                normalized_vals = [str(v).strip().upper() for v in row_vals if v is not None]
-                has_date = any("DATE" in v for v in normalized_vals)
-                has_cno = any(any(x in v for x in ["CNO", "C.NOTE", "AWB", "DOCKET", "C.NO", "C NO"]) for v in normalized_vals)
+            # 1. Scan all sheets and analyze candidates
+            sheet_candidates = []
+            date_sheets = []
+            
+            for sheet_name in wb.sheetnames:
+                temp_ws = wb[sheet_name]
+                header_row_idx = None
+                headers = None
                 
-                if has_date and has_cno:
-                    header_row_idx = r_idx
-                    headers = row_vals
-                    self.log_progress(f"Dynamically detected header row at Row {header_row_idx}: {headers}")
-                    break
+                # Check for standard header row in this sheet
+                for r_idx in range(1, 30):
+                    row_vals = [cell.value for cell in temp_ws[r_idx]]
+                    normalized_vals = [str(v).strip().upper() for v in row_vals if v is not None]
+                    has_date = any("DATE" in v for v in normalized_vals)
+                    has_cno = any(any(x in v for x in ["CNO", "C.NOTE", "AWB", "DOCKET", "C.NO", "C NO"]) for v in normalized_vals)
                     
-            if not header_row_idx:
-                self.log_progress("Could not dynamically find header row, falling back to Row 11.")
-                header_row_idx = 11
-                headers = [cell.value for cell in ws[11]]
-
-            header_map = {}
-            for col_idx, val in enumerate(headers, start=1):
-                if val:
-                    header_map[str(val).strip().upper()] = col_idx
-            
-            # Find exact keys
-            cno_col_idx = None
-            date_col_idx = None
-            weight_col_idx = None
-            
-            for k, idx in header_map.items():
-                if any(x in k for x in ["CNO", "C.NOTE", "AWB", "DOCKET", "C.NO", "C NO"]):
-                    cno_col_idx = idx
-                elif "DATE" in k:
-                    date_col_idx = idx
-                elif "WEIGHT" in k:
-                    weight_col_idx = idx
-            
-            if not cno_col_idx or not date_col_idx:
-                raise ValueError(f"Missing required columns (C.NOTE.NO / CNO. or DATE). Headers found: {headers}")
-
-            if not weight_col_idx:
-                weight_col_idx = 5
-                self.log_progress(f"WEIGHT column not found in headers, defaulting to Column {weight_col_idx}")
-
-            # Read all rows starting from row after headers dynamically
-            rows_data = []
-            valid_dates = []
-            
-            for row_idx in range(header_row_idx + 1, ws.max_row + 1):
-                cno_val = ws.cell(row=row_idx, column=cno_col_idx).value
-                date_val = ws.cell(row=row_idx, column=date_col_idx).value
-                weight_val = ws.cell(row=row_idx, column=weight_col_idx).value
+                    if has_date and has_cno:
+                        header_row_idx = r_idx
+                        headers = row_vals
+                        break
                 
-                if cno_val is None:
-                    continue # Skip empty row
-                
-                # Parse date_val
-                parsed_date = None
-                if isinstance(date_val, datetime):
-                    parsed_date = date_val
-                elif isinstance(date_val, str):
-                    date_str = date_val.strip()
-                    for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                if header_row_idx:
+                    # Map columns in this sheet candidate
+                    header_map = {str(val).strip().upper(): col_idx for col_idx, val in enumerate(headers, start=1) if val}
+                    cno_col_idx = None
+                    date_col_idx = None
+                    weight_col_idx = None
+                    
+                    for k, idx in header_map.items():
+                        if any(x in k for x in ["CNO", "C.NOTE", "AWB", "DOCKET", "C.NO", "C NO"]):
+                            cno_col_idx = idx
+                        elif "DATE" in k:
+                            date_col_idx = idx
+                        elif "WEIGHT" in k:
+                            weight_col_idx = idx
+                            
+                    if not weight_col_idx:
+                        weight_col_idx = 5
+                        
+                    if not cno_col_idx or not date_col_idx:
+                        continue # Required columns missing in this candidate, skip it
+                        
+                    # Count total rows and rows with missing weights
+                    total_data_rows = 0
+                    missing_weight_count = 0
+                    
+                    for row_idx in range(header_row_idx + 1, temp_ws.max_row + 1):
+                        cno_val = temp_ws.cell(row=row_idx, column=cno_col_idx).value
+                        if cno_val is not None:
+                            total_data_rows += 1
+                            weight_val = temp_ws.cell(row=row_idx, column=weight_col_idx).value
+                            if weight_val is None or str(weight_val).strip() == "":
+                                missing_weight_count += 1
+                    
+                    # Try to parse sheet name as a date format
+                    parsed_sheet_date = None
+                    sheet_name_clean = sheet_name.strip()
+                    for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%Y-%m-%d", "%d.%m.%y", "%d-%m-%y"):
                         try:
-                            parsed_date = datetime.strptime(date_str, fmt)
+                            parsed_sheet_date = datetime.strptime(sheet_name_clean, fmt)
                             break
                         except ValueError:
                             continue
+                            
+                    candidate = {
+                        "name": sheet_name,
+                        "ws": temp_ws,
+                        "header_row_idx": header_row_idx,
+                        "headers": headers,
+                        "cno_col_idx": cno_col_idx,
+                        "date_col_idx": date_col_idx,
+                        "weight_col_idx": weight_col_idx,
+                        "total_rows": total_data_rows,
+                        "missing_weights": missing_weight_count,
+                        "parsed_date": parsed_sheet_date
+                    }
+                    sheet_candidates.append(candidate)
+                    if parsed_sheet_date:
+                        date_sheets.append(candidate)
+
+            if not sheet_candidates:
+                raise ValueError("Could not find any sheet containing the required DATE and C.NOTE.NO columns.")
+
+            # Log sheet analysis transparently
+            self.log_progress("Analyzing sheets in workbook:")
+            for cand in sheet_candidates:
+                date_str_log = f"parsed date: {cand['parsed_date'].strftime('%Y-%m-%d')}" if cand['parsed_date'] else "no date name"
+                self.log_progress(f" - Sheet '{cand['name']}' ({date_str_log}): {cand['total_rows']} rows, {cand['missing_weights']} missing weights")
+
+            selected_sheets = []
+            
+            # Scenario A: If some sheet names are valid dates, select the one with the latest date!
+            if date_sheets:
+                # Sort by parsed date descending
+                date_sheets.sort(key=lambda x: x["parsed_date"], reverse=True)
+                selected_sheet = date_sheets[0]
+                self.log_progress(f"==> Selected Sheet '{selected_sheet['name']}' because it has the latest date name ({selected_sheet['parsed_date'].strftime('%d-%m-%Y')}).")
+                selected_sheets = [selected_sheet]
+            else:
+                # Scenario B: Generic sheet names - scan and process ALL valid data sheets!
+                self.log_progress("==> Generic sheet names detected. Selecting ALL valid sheets to process together.")
+                selected_sheets = sheet_candidates
+            
+            # 2. Compile rows from selected worksheets
+            rows_data = []
+            valid_dates = []
+            
+            for target_sheet in selected_sheets:
+                t_ws = target_sheet["ws"]
+                t_header_row_idx = target_sheet["header_row_idx"]
+                t_cno_col = target_sheet["cno_col_idx"]
+                t_date_col = target_sheet["date_col_idx"]
+                t_weight_col = target_sheet["weight_col_idx"]
                 
-                if parsed_date:
-                    valid_dates.append(parsed_date)
+                self.log_progress(f"Parsing rows from Sheet '{target_sheet['name']}'...")
                 
-                rows_data.append({
-                    'row_idx': row_idx,
-                    'cno': cno_val,
-                    'date': parsed_date,
-                    'weight': weight_val
-                })
+                for row_idx in range(t_header_row_idx + 1, t_ws.max_row + 1):
+                    cno_val = t_ws.cell(row=row_idx, column=t_cno_col).value
+                    date_val = t_ws.cell(row=row_idx, column=t_date_col).value
+                    weight_val = t_ws.cell(row=row_idx, column=t_weight_col).value
+                    
+                    if cno_val is None:
+                        continue # Skip empty row
+                    
+                    # Parse date_val
+                    parsed_date = None
+                    if isinstance(date_val, datetime):
+                        parsed_date = date_val
+                    elif isinstance(date_val, str):
+                        date_str = date_val.strip()
+                        for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                            try:
+                                parsed_date = datetime.strptime(date_str, fmt)
+                                break
+                            except ValueError:
+                                continue
+                    
+                    if parsed_date:
+                        # Ignore future outlier dates (e.g. year typos) for global boundary calculations
+                        if parsed_date <= datetime.now() + timedelta(days=1):
+                            valid_dates.append(parsed_date)
+                        else:
+                            self.log_progress(f"Skipping future outlier date in global range: {parsed_date.strftime('%d-%m-%Y')} on Row {row_idx} in Sheet '{target_sheet['name']}'")
+                    
+                    rows_data.append({
+                        'ws': t_ws,
+                        'weight_col_idx': t_weight_col,
+                        'row_idx': row_idx,
+                        'cno': cno_val,
+                        'date': parsed_date,
+                        'weight': weight_val
+                    })
 
             if not rows_data:
                 raise ValueError("Excel data is empty.")
@@ -454,11 +611,12 @@ class TrackonAutomation:
             if not valid_dates:
                 raise ValueError("No valid dates found in the DATE column.")
 
-            min_date = min(valid_dates)
-            max_date = max(valid_dates)
+            # Add a 2-day padding buffer to dates to handle manifest delays
+            min_date = min(valid_dates) - timedelta(days=2)
+            max_date = min(max(valid_dates) + timedelta(days=2), datetime.now() + timedelta(days=1))
             self.state["total_rows"] = len(rows_data)
             
-            self.log_progress(f"Loaded {len(rows_data)} rows. Date range found: {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
+            self.log_progress(f"Loaded {len(rows_data)} rows. Date range found (with 2-day padding buffer): {min_date.strftime('%d-%m-%Y')} to {max_date.strftime('%d-%m-%Y')}")
 
             # Initialize selenium
             self.setup_driver()
@@ -482,22 +640,38 @@ class TrackonAutomation:
             self.log_progress("Writing weights back to Excel...")
             count = 0
             for row in rows_data:
-                cno_id = str(row['cno']).strip().split('.')[0]
+                # 1. Secure integer string cleaning for AWBs (prevents float & scientific format mismatches)
+                cno_raw = row['cno']
+                cno_id = ""
+                if isinstance(cno_raw, (int, float)):
+                    cno_id = f"{int(cno_raw)}"
+                elif cno_raw is not None:
+                    cno_id = str(cno_raw).strip().split('.')[0]
                 
                 self.state["processed_rows"] += 1
                 # Progress percentage
                 self.state["progress"] = int((self.state["processed_rows"] / self.state["total_rows"]) * 100)
                 
+                # 2. Advanced Fuzzy Matcher (Exact -> Substring Fallback)
+                found_weight = None
                 if cno_id in all_extracted_weights:
+                    found_weight = all_extracted_weights[cno_id]
+                else:
+                    # Fallback to substring matching (useful for prefix/suffix differences or dropped zeroes)
+                    matched_key = next((k for k in all_extracted_weights if cno_id in k or k in cno_id), None)
+                    if matched_key:
+                        found_weight = all_extracted_weights[matched_key]
+                
+                if found_weight is not None:
                     if row['weight'] is not None and str(row['weight']).strip() != "":
                         continue
                     
                     # Formats weight as "{weight} KG"
-                    raw_weight = str(all_extracted_weights[cno_id]).strip()
+                    raw_weight = str(found_weight).strip()
                     if raw_weight:
                         cleaned_weight = raw_weight.upper().replace("KG", "").strip()
                         formatted_weight = f"{cleaned_weight} KG"
-                        ws.cell(row=row['row_idx'], column=weight_col_idx).value = formatted_weight
+                        row['ws'].cell(row=row['row_idx'], column=row['weight_col_idx']).value = formatted_weight
                         count += 1
 
             self.state["weights_updated"] = count
