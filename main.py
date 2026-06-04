@@ -204,19 +204,16 @@ async def query_single_awb(
         results = runner.extract_table_data()
         
         awb_cleaned = str(awb).strip()
-        weight = results.get(awb_cleaned)
+        found_weights = results.get(awb_cleaned)
         
-        if weight:
-            # Clean and format
-            cleaned_w = str(weight).upper().replace("KG", "").strip()
-            formatted_w = f"{cleaned_w} KG"
+        if found_weights:
+            formatted_w = runner.format_combined_weights(found_weights)
             return {"awb": awb, "weight": formatted_w, "found": True}
         else:
             # Try substring matching
             matched_key = next((k for k in results if awb_cleaned in k or k in awb_cleaned), None)
             if matched_key:
-                cleaned_w = str(results[matched_key]).upper().replace("KG", "").strip()
-                formatted_w = f"{cleaned_w} KG"
+                formatted_w = runner.format_combined_weights(results[matched_key])
                 return {"awb": awb, "weight": formatted_w, "found": True, "matched_docket": matched_key}
                 
             return {"awb": awb, "weight": None, "found": False, "message": "AWB not found in report records for this range."}

@@ -60,6 +60,39 @@ class TrackonAutomation:
             except Exception as meta_err:
                 logger.error(f"Failed to write run metadata: {meta_err}")
 
+    def format_combined_weights(self, weights_list):
+        """
+        Parses a list of weight strings, sums their numeric values, and
+        returns a formatted string like 'X KG' or 'X.Y KG'.
+        """
+        if not weights_list:
+            return None
+            
+        total = 0.0
+        parsed_any = False
+        
+        for w in weights_list:
+            if w is None:
+                continue
+            cleaned = str(w).upper().replace("KG", "").strip()
+            if not cleaned:
+                continue
+            try:
+                val = float(cleaned)
+                total += val
+                parsed_any = True
+            except ValueError:
+                self.log_progress(f"Warning: Could not parse weight string '{w}' as float.")
+                
+        if not parsed_any:
+            return None
+            
+        if total.is_integer():
+            return f"{int(total)} KG"
+        else:
+            rounded = round(total, 3)
+            return f"{rounded} KG"
+
     def setup_driver(self):
         self.log_progress("Initializing Chrome Driver...")
         options = webdriver.ChromeOptions()
@@ -394,10 +427,15 @@ class TrackonAutomation:
                                 awb = cells[awb_idx].text.strip()
                                 weight = cells[weight_idx].text.strip()
                                 if awb:
-                                    page_data[awb] = weight
+                                    if awb not in page_data:
+                                        page_data[awb] = []
+                                    page_data[awb].append(weight)
                                     
                         # Update global results on success
-                        extracted_data.update(page_data)
+                        for awb, weights in page_data.items():
+                            if awb not in extracted_data:
+                                extracted_data[awb] = []
+                            extracted_data[awb].extend(weights)
                         scraped_page_successfully = True
                         break
                         
@@ -632,7 +670,10 @@ class TrackonAutomation:
                 
                 self.perform_search(temp_start, temp_end)
                 batch_results = self.extract_table_data()
-                all_extracted_weights.update(batch_results)
+                for awb, weights in batch_results.items():
+                    if awb not in all_extracted_weights:
+                        all_extracted_weights[awb] = []
+                    all_extracted_weights[awb].extend(weights)
                 
                 temp_start = temp_end + timedelta(days=1)
 
@@ -653,24 +694,21 @@ class TrackonAutomation:
                 self.state["progress"] = int((self.state["processed_rows"] / self.state["total_rows"]) * 100)
                 
                 # 2. Advanced Fuzzy Matcher (Exact -> Substring Fallback)
-                found_weight = None
+                found_weights = None
                 if cno_id in all_extracted_weights:
-                    found_weight = all_extracted_weights[cno_id]
+                    found_weights = all_extracted_weights[cno_id]
                 else:
                     # Fallback to substring matching (useful for prefix/suffix differences or dropped zeroes)
                     matched_key = next((k for k in all_extracted_weights if cno_id in k or k in cno_id), None)
                     if matched_key:
-                        found_weight = all_extracted_weights[matched_key]
+                        found_weights = all_extracted_weights[matched_key]
                 
-                if found_weight is not None:
+                if found_weights:
                     if row['weight'] is not None and str(row['weight']).strip() != "":
                         continue
                     
-                    # Formats weight as "{weight} KG"
-                    raw_weight = str(found_weight).strip()
-                    if raw_weight:
-                        cleaned_weight = raw_weight.upper().replace("KG", "").strip()
-                        formatted_weight = f"{cleaned_weight} KG"
+                    formatted_weight = self.format_combined_weights(found_weights)
+                    if formatted_weight:
                         row['ws'].cell(row=row['row_idx'], column=row['weight_col_idx']).value = formatted_weight
                         count += 1
 
