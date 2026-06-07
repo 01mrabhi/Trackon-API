@@ -330,12 +330,21 @@ class TrackonAutomation:
             if old_table:
                 try:
                     self.log_progress("Waiting for old results to clear...")
-                    WebDriverWait(self.driver, 10).until(EC.staleness_of(old_table))
+                    WebDriverWait(self.driver, 15).until(EC.staleness_of(old_table))
                     self.log_progress("Table refreshed. Loading new records...")
                 except Exception as sync_err:
-                    self.log_progress(f"Table refresh wait completed/skipped: {sync_err}")
+                    self.log_progress("Table refresh wait completed/skipped (staleness timeout).")
             else:
                 time.sleep(5)
+                
+            # Additional wait if there's a preloader
+            try:
+                self.log_progress("Checking if a preloader is active...")
+                WebDriverWait(self.driver, 30).until(
+                    EC.invisibility_of_element_located((By.ID, "customPreloader"))
+                )
+            except Exception:
+                pass
             
         except Exception as e:
             self.log_progress(f"Search input failed: {e}")
@@ -344,11 +353,12 @@ class TrackonAutomation:
         """Scrapes the visible table with dynamic column detection and page navigation."""
         extracted_data = {}
         try:
-            self.log_progress("Waiting for table results to load (up to 15 seconds)...")
+            timeout_seconds = 45  # Increased timeout for slow networks
+            self.log_progress(f"Waiting for table results to load (up to {timeout_seconds} seconds)...")
             start_time = time.time()
             table_loaded = False
             
-            while time.time() - start_time < 15:
+            while time.time() - start_time < timeout_seconds:
                 try:
                     rows = self.driver.find_elements(By.XPATH, "//table[@id='tbldetails']/tbody/tr")
                     if rows:
@@ -366,13 +376,21 @@ class TrackonAutomation:
                             break
                 except Exception:
                     pass
-                time.sleep(0.5)
+                time.sleep(1)
 
             if not table_loaded:
-                self.log_progress("Table loading timed out. Checking page source as fallback...")
-                if "No data available" in self.driver.page_source or "No records found" in self.driver.page_source:
-                    self.log_progress("No records found for this range.")
-                    return extracted_data
+                self.log_progress("Table loading timed out. Checking table text as fallback...")
+                try:
+                    table_elem = self.driver.find_element(By.ID, "tbldetails")
+                    table_text = table_elem.text
+                    if "No data available" in table_text or "No records found" in table_text or "No booking found" in table_text:
+                        self.log_progress("No records found for this range (found in table text).")
+                        return extracted_data
+                except Exception:
+                    pass
+                
+                self.log_progress("Warning: Could not confirm table load or empty status. Returning empty extracted data.")
+                return extracted_data
 
             previous_first_awb = None
             
